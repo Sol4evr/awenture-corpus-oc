@@ -1,0 +1,69 @@
+name: One-time SHA-verified corpus import
+on:
+  push:
+    paths: ['.github/workflows/import-corpus.yml']
+permissions:
+  contents: write
+concurrency:
+  group: immutable-corpus-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CORPUS_AREA: oc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+          fetch-depth: 1
+      - name: Download pinned source and verify every SHA-256
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os,json,hashlib,urllib.request,urllib.parse,pathlib,concurrent.futures
+          source='7a80d4b80bcadc22ca5486a7ed3a50c133fc0a47'
+          url='https://raw.githubusercontent.com/Sol4evr/awenture/'+source+'/baseline/historical-corpus-v1-lfs-index.json'
+          data=urllib.request.urlopen(url,timeout=60).read()
+          index=json.loads(data)
+          assert index['sourceCommit']=='eea48e7df6064b216d26366f2ee5719a573c392e'
+          assert index['paths']==602 and len(index['objects'])==602 and index['uniqueObjects']==565
+          area=os.environ['CORPUS_AREA']
+          prefix={'icas':'source/original-icas/','naplan':'source/naplan/','oc':'source/oc/'}[area]
+          entries=[x for x in index['objects'] if x['path'].startswith(prefix)]
+          assert len(entries)=={'icas':261,'naplan':290,'oc':51}[area]
+          cache={}
+          def download(x):
+              path=pathlib.PurePosixPath(x['path'])
+              assert path.is_relative_to('source') and '..' not in path.parts and path.suffix.lower()=='.pdf'
+              assert x['size']<50*1024*1024
+              u='https://media.githubusercontent.com/media/Sol4evr/awenture/'+index['sourceCommit']+'/'+urllib.parse.quote(x['path'])
+              b=urllib.request.urlopen(u,timeout=90).read()
+              assert len(b)==x['size'] and hashlib.sha256(b).hexdigest()==x['oid'] and b[:5]==b'%PDF-',x['path']
+              return x['oid'],b
+          if pathlib.Path('corpus-index.json').exists():
+              raise RuntimeError('Immutable corpus already imported; refusing another LFS transfer')
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+              for oid,b in pool.map(download,{x['oid']:x for x in entries}.values()):cache[oid]=b
+          for x in entries:
+              p=pathlib.Path(x['path']);p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(cache[x['oid']])
+          pathlib.Path('.gitattributes').write_text('*.pdf -filter -diff -merge -text\n')
+          pathlib.Path('corpus-index.json').write_text(json.dumps({'version':'aw-normal-git-corpus-v1','area':area,'sourceCommit':index['sourceCommit'],'sourceIndexSha256':hashlib.sha256(data).hexdigest(),'files':entries},indent=2)+'\n')
+          pathlib.Path('README.md').write_text('# AWenture '+area.upper()+' corpus\n\nImmutable normal-Git historical source mirror. Every PDF is SHA-256 and size verified against corpus-index.json. Pin an exact commit. No Git LFS. Source materials retain their existing rights; no new licence is granted. Learners must use AWenture’s learner-safe PDF proxy.\n')
+          print(json.dumps({'verifiedPaths':len(entries),'uniqueObjects':len(cache),'bytes':sum(len(b) for b in cache.values()),'lfsPointers':0}))
+          
+          PY
+      - name: Commit verified normal-Git corpus
+        shell: bash
+        run: |
+          git config user.name 'AWenture corpus importer'
+          git config user.email '122612876+Sol4evr@users.noreply.github.com'
+          git add .gitattributes README.md corpus-index.json source
+          if git grep -Il '^version https://git-lfs.github.com/spec/v1$' -- '*.pdf'; then
+            echo 'Refusing LFS pointers' >&2
+            exit 1
+          fi
+          git commit -m 'Import complete SHA-verified historical corpus without Git LFS'
+          git push origin HEAD:main
+          git rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
